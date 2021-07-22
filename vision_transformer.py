@@ -9,6 +9,27 @@ Created on Thu Jul 22 11:36:17 2021
 import tensorflow_addons as tfa
 import tensorflow as tf
 
+def drop_path(x, drop_prob=0.0, training=False):
+    if drop_prob == 0.0 or not training:
+        return x
+    keep_prob = 1 - drop_prob
+    
+    shape = (tf.shape(x)[0], ) + (1, ) * (tf.rank(x) - 1)
+    random_tensor = keep_prob + tf.random.normal(shape, dtype=x.dtype)
+    random_tensor = tf.math.floor(random_tensor)
+    output = tf.math.divide(x, keep_prob) * random_tensor
+    return output
+
+class DropPath(tf.keras.layers.Layer):
+    def __init__(self, drop_prob=None):
+        super(DropPath, self).__init__()
+        self.drop_prob = drop_prob
+        
+    def call(self, x):
+        return drop_path(x, self.drop_prob, self.trainable)
+    
+    
+
 def Mlp(in_features, hidden_features=None, out_features=None, activation=None, dropout=0.0, **kwargs):
     out_features = out_features or in_features
     hidden_features = hidden_features or in_features
@@ -61,6 +82,8 @@ def Block(dim, num_heads, mlp_ratio=4., qkv_bias=False, qk_scale=None, drop=0., 
                      attn_drop=attn_drop, proj_drop=drop)
     x = tf.keras.layers.LayerNormalization()(inputs)
     x , attention = attn(x)
+    drop_path = DropPath(drop_path)
+    x = drop_path(x)
     x = tf.keras.layers.Add()([x, inputs])
     y = tf.keras.layers.LayerNormalization()(x)
 
@@ -68,10 +91,14 @@ def Block(dim, num_heads, mlp_ratio=4., qkv_bias=False, qk_scale=None, drop=0., 
             activation=act_layer, dropout=drop)(y)
 
     
+    y = drop_path(y)
+    x = tf.keras.layers.Add()([x, y])
+    return tf.keras.Model(inputs, [x, attention], **kwargs)
+    
 
     x = tf.keras.layers.Add()([x, y])
     return tf.keras.Model(inputs, [x, attention], **kwargs)
-
+"""
 def Vit(img_size=224, patch_size=16, in_chans=3, num_classes=0, embed_dim=768, depth=2,
                  num_heads=12, mlp_ratio=4., qkv_bias=False, qk_scale=None, drop_rate=0., attn_drop_rate=0.,
                  drop_path_rate=0., **kwargs):
@@ -93,6 +120,62 @@ def Vit(img_size=224, patch_size=16, in_chans=3, num_classes=0, embed_dim=768, d
     x = tf.keras.layers.LayerNormalization(epsilon=1e-6)(x)
     x = tf.keras.layers.Lambda(lambda x:x[:, 0])(x)
     return tf.keras.Model(inputs, [x, attentions], name="vision_transformer", **kwargs)
+"""
+class VisionTransformer(tf.keras.Model):
+    def __init__(self, img_size=224, patch_size=16, in_chans=3, num_classes=0, embed_dim=768, depth=2,
+                     num_heads=12, mlp_ratio=4., qkv_bias=False, qk_scale=None, drop_rate=0., attn_drop_rate=0.,
+                     drop_path_rate=0., **kwargs):
+        super(VisionTransformer, self).__init__()
+        self.img_size = img_size
+        self.in_chans = in_chans
+        self.patch_size = patch_size
+        self.embed_dim = embed_dim
+        self.depth = depth
+        self.num_heads = num_heads
+        self.mlp_ratio = mlp_ratio
+        self.qkv_bias = qkv_bias
+        self.qk_scale = qk_scale
+        self.drop_rate = drop_rate
+        self.attn_drop_rate = attn_drop_rate
+        self.drop_path_rate = drop_path_rate
+        self.kwargs = kwargs
+        
+        self.inputs_ = tf.keras.layers.Input((img_size, img_size, in_chans))
+        self.patch_embed = PatchEmbed(img_size=self.img_size, patch_size=self.patch_size,
+                                      in_chans=self.in_chans, embed_dim=self.embed_dim)
+        self.cls_token_layer = tf.keras.layers.Lambda(lambda x : tf.random.truncated_normal((tf.shape(x)[0], 1, x.shape[2]), stddev=0.2), **{'name':'class_token'})
+        self.concat = tf.keras.layers.Concatenate(axis=1)
+        self.pos_embed_layer = tf.keras.layers.Lambda(lambda x: tf.tile(tf.random.truncated_normal((1, x.shape[1], x.shape[2]), stddev=0.2), (tf.shape(x)[0], 1, 1)),
+                          **{'name':'position_encoding'})
+        self.layer_add = tf.keras.layers.Add()
+        self.pos_drop = tf.keras.layers.Dropout(self.drop_rate)
+        dpr = [elem.numpy() for elem in tf.linspace(0.0, self.drop_path_rate, self.depth)]
+        self.blocks = [Block(dim=self.embed_dim, num_heads=self.num_heads, mlp_ratio=self.mlp_ratio, qkv_bias=self.qkv_bias,
+                                 qk_scale=self.qk_scale, drop=self.drop_rate, attn_drop=self.attn_drop_rate,
+                             drop_path = dpr[i], **{'name':'block_{}'.format(i+1)})
+                      for i in range(self.depth)]
+        self.layer_norm = tf.keras.layers.LayerNormalization(epsilon=1e-6)
+        self.get_item = tf.keras.layers.Lambda(lambda x:x[:, 0])
+        self.out = self.call(self.inputs_)
+        self.build(self.inputs_.shape)
+        
+    def call(self, x):
+        x = self.patch_embed(x)
+        self.cls_token = self.cls_token_layer(x)
+        x = self.concat([self.cls_token, x])
+
+        self.pos_embed = self.pos_embed_layer(x)
+
+        x = self.layer_add([x, self.pos_embed])
+        x = self.pos_drop(x)
+        attentions = []
+        for blk in self.blocks:
+            x, attn = blk(x)
+            attentions.append(attn)
+        x = self.layer_norm(x)
+        x = self.get_item(x)
+        return [x, attentions]
+    
 
 def get_last_selfattention(vit_model, x):
     result, attentions = vit_model(x)
